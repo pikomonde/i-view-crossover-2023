@@ -3,6 +3,7 @@ Object.defineProperty(exports, "__esModule", { value: true });
 const redis = require("redis");
 const memcached = require("memcached");
 const util = require("util");
+const {performance} = require('perf_hooks');
 const KEY = `account1/balance`;
 const DEFAULT_BALANCE = 100;
 const MAX_EXPIRATION = 60 * 60 * 24 * 30;
@@ -29,26 +30,33 @@ exports.chargeRequestRedis = async function (input) {
 };
 async function chargeRedisReq() {
     const redisClient = await getRedisClient();
-    var startTime = new Date().getTime();
-    var remainingBalance = await getBalanceRedis(redisClient, KEY);
+    var startTime = performance.now();
     var charges = getCharges();
-    const isAuthorized = authorizeRequest(remainingBalance, charges);
-    if (!isAuthorized) {
-        return {
-            remainingBalance,
-            isAuthorized,
-            charges: 0,
-            startTime,
-            timeElapsed: (new Date().getTime() - startTime),
-        };
-    }
-    remainingBalance = await chargeRedis(redisClient, KEY, charges);
-    var timeElapsed = (new Date().getTime() - startTime);
+    var response = await new Promise((resolve, reject) => {
+        var luaScript = "local balance = redis.call('GET', KEYS[1]);" +
+          "if( tonumber(balance) >= tonumber(ARGV[1]) ) then" +
+          "  return { true, redis.call('DECRBY', KEYS[1], ARGV[1]) }" +
+          "else" +
+          "  return { false, balance }" +
+          "end";
+        redisClient.eval(luaScript, 1, KEY, charges, function(err, res) {
+            if (err) {
+                reject(err);
+            }
+            else {
+                resolve({
+                    "isAuthorized": Boolean(res[0]),
+                    "remainingBalance": Number(res[1]),
+                });
+            }
+          });
+    });
+    var timeElapsed = (performance.now() - startTime);
     await disconnectRedis(redisClient);
     return {
-        remainingBalance,
-        charges,
-        isAuthorized,
+        remainingBalance: response.remainingBalance,
+        charges: response.isAuthorized ? charges : 0,
+        isAuthorized: response.isAuthorized,
         startTime,
         timeElapsed,
     };
@@ -100,26 +108,31 @@ exports.chargeRequestMemcached = async function (input) {
     return null;
 };
 async function chargeMemcachedReq() {
-    var remainingBalance = await getBalanceMemcached(KEY);
-    var startTime = new Date().getTime();
+    var remainingBalanceWithCas = await getBalanceMemcachedWithCas(KEY);
+    var startTime = performance.now();;
     const charges = getCharges();
-    const isAuthorized = authorizeRequest(remainingBalance, charges);
-    if (!authorizeRequest(remainingBalance, charges)) {
+    const isAuthorized = authorizeRequest(remainingBalanceWithCas.data, charges);
+    if (!authorizeRequest(remainingBalanceWithCas.data, charges)) {
         return {
-            remainingBalance,
+            remainingBalance: remainingBalanceWithCas.data,
             isAuthorized,
             charges: 0,
             startTime,
-            timeElapsed: (new Date().getTime() - startTime),
+            timeElapsed: (performance.now() - startTime),
         };
     }
-    remainingBalance = await chargeMemcached(KEY, charges);
+    var updatedRemainingBalance = remainingBalanceWithCas.data - charges;
+    var successCharge = await chargeMemcached(KEY, remainingBalanceWithCas.cas, updatedRemainingBalance);
+    var remainingBalance = 0;
+    if (!successCharge) {
+        remainingBalance = await getBalanceMemcached(KEY);
+    }
     return {
-        remainingBalance,
-        charges,
-        isAuthorized,
+        remainingBalance: successCharge ? updatedRemainingBalance : remainingBalance,
+        charges: successCharge ? charges : 0,
+        isAuthorized: isAuthorized && successCharge,
         startTime,
-        timeElapsed: (new Date().getTime() - startTime),
+        timeElapsed: (performance.now() - startTime),
     };
 };
 function printResponses(responses) {
@@ -208,15 +221,30 @@ async function getBalanceMemcached(key) {
         });
     });
 }
-async function chargeMemcached(key, charges) {
-    // await new Promise(r => setTimeout(r, 100));
+async function getBalanceMemcachedWithCas(key) {
     return new Promise((resolve, reject) => {
-        memcachedClient.decr(key, charges, (err, result) => {
+        memcachedClient.gets(key, (err, data) => {
             if (err) {
                 reject(err);
             }
             else {
-                return resolve(Number(result));
+                resolve({
+                    "data": Number(data[key]),
+                    "cas": Number(data.cas),
+                });
+            }
+        });
+    });
+}
+async function chargeMemcached(key, casKey, newBalance) {
+    // await new Promise(r => setTimeout(r, 100));
+    return new Promise((resolve, reject) => {
+        memcachedClient.cas(key, newBalance, casKey, MAX_EXPIRATION, (err, result) => {
+            if (err) {
+                reject(err);
+            }
+            else {
+                return resolve(Boolean(result));
             }
         });
     });
